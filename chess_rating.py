@@ -1,16 +1,58 @@
 import sys
 import requests
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QLabel, QLineEdit, QComboBox, 
-                             QPushButton, QGroupBox, QGridLayout, QMessageBox,
-                             QSizePolicy, QFrame, QProgressBar)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QPixmap
-from io import BytesIO
+import json
+import os
 from datetime import datetime
+from io import BytesIO
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QLineEdit, QComboBox, QPushButton, QGroupBox, QGridLayout,
+    QMessageBox, QFrame, QSplitter, QScrollArea
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QPixmap, QFont, QPainter, QColor, QBrush, QPen
+from PyQt6.QtCore import QRect
+
+# Файл для кеша
+CACHE_FILE = "chess_cache.json"
+CACHE_DURATION = 3600  # 1 час в секундах
+
+class CacheManager:
+    """Менеджер кеширования"""
+    def __init__(self):
+        self.cache = {}
+        self.load_cache()
+    
+    def load_cache(self):
+        try:
+            if os.path.exists(CACHE_FILE):
+                with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                    self.cache = json.load(f)
+        except:
+            self.cache = {}
+    
+    def save_cache(self):
+        try:
+            with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.cache, f, ensure_ascii=False, indent=2)
+        except:
+            pass
+    
+    def get(self, key):
+        if key in self.cache:
+            entry = self.cache[key]
+            if datetime.now().timestamp() - entry['timestamp'] < CACHE_DURATION:
+                return entry['data']
+        return None
+    
+    def set(self, key, data):
+        self.cache[key] = {
+            'timestamp': datetime.now().timestamp(),
+            'data': data
+        }
+        self.save_cache()
 
 class RatingFetcher(QThread):
-    """Поток для получения рейтинга без блокировки UI"""
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
     
@@ -19,20 +61,28 @@ class RatingFetcher(QThread):
         self.platform = platform
         self.username = username
         self.game_type = game_type
+        self.cache_manager = CacheManager()
     
     def run(self):
         try:
+            cache_key = f"{self.platform}_{self.username}_{self.game_type}"
+            cached_data = self.cache_manager.get(cache_key)
+            
+            if cached_data:
+                self.finished.emit(cached_data)
+                return
+            
             if self.platform == "Lichess":
                 data = self.get_lichess_data()
             else:
                 data = self.get_chesscom_data()
             
+            self.cache_manager.set(cache_key, data)
             self.finished.emit(data)
         except Exception as e:
             self.error.emit(str(e))
     
     def get_lichess_data(self):
-        # Получаем основную информацию о пользователе
         url = f"https://lichess.org/api/user/{self.username}"
         headers = {"Accept": "application/json"}
         response = requests.get(url, headers=headers, timeout=10)
@@ -44,7 +94,6 @@ class RatingFetcher(QThread):
         
         data = response.json()
         
-        # Получаем рейтинг для выбранного типа игры
         if "perfs" in data and self.game_type in data["perfs"]:
             rating = data["perfs"][self.game_type].get("rating")
         else:
@@ -55,54 +104,8 @@ class RatingFetcher(QThread):
             'avatar': data.get("avatar", None),
             'username': data.get("username", self.username),
             'joined': data.get("createdAt", None),
-            'platform': 'Lichess',
-            'total_games': 0,
-            'total_wins': 0,
-            'total_draws': 0,
-            'total_losses': 0,
-            'game_stats': {}
+            'platform': 'Lichess'
         }
-        
-        # Получаем детальную статистику через отдельные запросы
-        game_types = ["bullet", "blitz", "rapid", "classical", "ultraBullet"]
-        
-        for game_type in game_types:
-            try:
-                # Используем правильный эндпоинт для получения статистики
-                perf_url = f"https://lichess.org/api/user/{self.username}/perf/{game_type}"
-                perf_response = requests.get(perf_url, headers=headers, timeout=10)
-                
-                if perf_response.status_code == 200:
-                    perf_data = perf_response.json()
-                    
-                    # Извлекаем статистику
-                    games = perf_data.get("games", 0)
-                    wins = perf_data.get("wins", 0)
-                    draws = perf_data.get("draws", 0)
-                    losses = perf_data.get("losses", 0)
-                    rating_val = perf_data.get("rating", 0)
-                    
-                    stats['game_stats'][game_type] = {
-                        'games': games,
-                        'wins': wins,
-                        'draws': draws,
-                        'losses': losses,
-                        'rating': rating_val
-                    }
-                    
-                    # Добавляем к общей статистике
-                    stats['total_games'] += games
-                    stats['total_wins'] += wins
-                    stats['total_draws'] += draws
-                    stats['total_losses'] += losses
-            except Exception as e:
-                # Если запрос не удался, пробуем использовать данные из основного запроса
-                if "perfs" in data and game_type in data["perfs"]:
-                    perf_data = data["perfs"][game_type]
-                    games = perf_data.get("games", 0)
-                    # Для Lichess в основном запросе нет wins/draws/losses, поэтому оставляем 0
-                    # Но мы уже получили данные через отдельный запрос
-                    pass
         
         return stats
     
@@ -111,7 +114,6 @@ class RatingFetcher(QThread):
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         
-        # Получаем статистику игрока
         url = f"https://api.chess.com/pub/player/{self.username}/stats"
         response = requests.get(url, headers=headers, timeout=10)
         
@@ -124,7 +126,6 @@ class RatingFetcher(QThread):
         
         data = response.json()
         
-        # Получаем рейтинг
         game_map = {
             "bullet": "chess_bullet",
             "blitz": "chess_blitz",
@@ -147,125 +148,77 @@ class RatingFetcher(QThread):
         if rating is None:
             raise Exception(f"Рейтинг для '{self.game_type}' не найден у игрока '{self.username}'!")
         
-        # Получаем информацию об игроке
         player_url = f"https://api.chess.com/pub/player/{self.username}"
         player_response = requests.get(player_url, headers=headers, timeout=10)
         player_data = {}
         if player_response.status_code == 200:
             player_data = player_response.json()
         
-        # Получаем статистику
         stats = {
             'rating': rating,
             'avatar': player_data.get("avatar", None),
             'username': player_data.get("username", self.username),
             'joined': player_data.get("joined", None),
-            'platform': 'Chess.com',
-            'total_games': 0,
-            'total_wins': 0,
-            'total_draws': 0,
-            'total_losses': 0,
-            'game_stats': {}
+            'platform': 'Chess.com'
         }
-        
-        # Chess.com статистика
-        chess_types = {
-            'bullet': 'chess_bullet',
-            'blitz': 'chess_blitz',
-            'rapid': 'chess_rapid',
-            'classical': 'chess_daily'
-        }
-        
-        for game_type_key, api_key in chess_types.items():
-            if api_key in data:
-                game_data = data[api_key]
-                games = 0
-                wins = 0
-                draws = 0
-                losses = 0
-                rating_val = 0
-                
-                if 'record' in game_data:
-                    wins = game_data['record'].get('win', 0)
-                    draws = game_data['record'].get('draw', 0)
-                    losses = game_data['record'].get('loss', 0)
-                    games = wins + draws + losses
-                
-                if 'last' in game_data and 'rating' in game_data['last']:
-                    rating_val = game_data['last']['rating']
-                elif 'best' in game_data and 'rating' in game_data['best']:
-                    rating_val = game_data['best']['rating']
-                
-                stats['game_stats'][game_type_key] = {
-                    'games': games,
-                    'wins': wins,
-                    'draws': draws,
-                    'losses': losses,
-                    'rating': rating_val
-                }
-                
-                stats['total_games'] += games
-                stats['total_wins'] += wins
-                stats['total_draws'] += draws
-                stats['total_losses'] += losses
         
         return stats
 
 class ChessRatingApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Шахматный рейтинг и ранг")
-        self.setMinimumSize(1100, 750)
-        self.resize(1200, 800)
+        self.setWindowTitle("♟ Шахматный рейтинг и ранг")
+        self.setMinimumSize(1000, 800)
+        self.resize(1200, 900)
         
+        # Основной стиль
         self.setStyleSheet("""
             QMainWindow {
-                background-color: #1a1a1a;
+                background-color: #0d0d0d;
             }
             QWidget {
-                background-color: #1a1a1a;
+                background-color: #0d0d0d;
             }
             QLabel {
                 color: #e0e0e0;
-                font-size: 14px;
+                font-size: 13px;
             }
             QGroupBox {
                 color: #ffffff;
-                border: 2px solid #3a3a3a;
-                border-radius: 10px;
-                margin-top: 15px;
-                padding-top: 15px;
-                font-size: 15px;
+                border: 1px solid #2a2a2a;
+                border-radius: 16px;
+                margin-top: 12px;
+                padding-top: 12px;
+                font-size: 14px;
                 font-weight: bold;
-                background-color: #252525;
+                background-color: #141414;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
                 left: 15px;
-                padding: 0 10px 0 10px;
+                padding: 0 12px 0 12px;
                 color: #ffd700;
             }
             QLineEdit {
-                background-color: #2d2d2d;
+                background-color: #1e1e1e;
                 color: #ffffff;
-                border: 2px solid #3a3a3a;
-                border-radius: 6px;
-                padding: 10px 14px;
+                border: 2px solid #2a2a2a;
+                border-radius: 10px;
+                padding: 12px 14px;
                 font-size: 14px;
                 selection-background-color: #4a6fa5;
-                min-height: 30px;
             }
             QLineEdit:focus {
                 border: 2px solid #4a6fa5;
+                background-color: #252525;
             }
             QComboBox {
-                background-color: #2d2d2d;
+                background-color: #1e1e1e;
                 color: #ffffff;
-                border: 2px solid #3a3a3a;
-                border-radius: 6px;
-                padding: 10px 14px;
+                border: 2px solid #2a2a2a;
+                border-radius: 10px;
+                padding: 12px 14px;
                 font-size: 14px;
-                min-height: 30px;
             }
             QComboBox:hover {
                 border: 2px solid #4a6fa5;
@@ -282,9 +235,9 @@ class ChessRatingApp(QMainWindow):
                 margin-right: 10px;
             }
             QComboBox QAbstractItemView {
-                background-color: #2d2d2d;
+                background-color: #1e1e1e;
                 color: #ffffff;
-                border: 2px solid #3a3a3a;
+                border: 2px solid #2a2a2a;
                 selection-background-color: #4a6fa5;
                 padding: 5px;
             }
@@ -292,11 +245,10 @@ class ChessRatingApp(QMainWindow):
                 background-color: #4a6fa5;
                 color: white;
                 border: none;
-                border-radius: 8px;
-                padding: 12px 24px;
-                font-size: 15px;
+                border-radius: 10px;
+                padding: 14px 24px;
+                font-size: 16px;
                 font-weight: bold;
-                min-height: 40px;
             }
             QPushButton:hover {
                 background-color: #5a7fb5;
@@ -305,181 +257,175 @@ class ChessRatingApp(QMainWindow):
                 background-color: #3a5f95;
             }
             QPushButton:disabled {
-                background-color: #3a3a3a;
-                color: #666;
+                background-color: #2a2a2a;
+                color: #555;
             }
-            #avatar_label {
-                background-color: #2d2d2d;
-                border: 3px solid #4a6fa5;
-                min-width: 120px;
-                min-height: 120px;
-                max-width: 120px;
-                max-height: 120px;
+            QScrollArea {
+                border: none;
+                background-color: transparent;
             }
-            #rating_label {
-                font-size: 32px;
-                font-weight: bold;
-                color: #87ceeb;
-                padding: 10px;
-                background-color: #2d2d2d;
-                border-radius: 10px;
-                min-width: 120px;
-            }
-            #rank_label {
-                font-size: 72px;
-                font-weight: bold;
-                color: #ffd700;
-                padding: 10px;
-                background-color: #2d2d2d;
-                border-radius: 10px;
-                min-height: 90px;
-                min-width: 100px;
-            }
-            #rank_description_label {
-                color: #ffd700;
-                font-size: 16px;
-                padding: 12px 18px;
-                background-color: #2d2d2d;
+            QScrollBar:vertical {
+                background-color: #1a1a1a;
+                width: 4px;
                 border-radius: 8px;
-                border-left: 4px solid #ffd700;
-                min-height: 60px;
             }
-            #username_label {
-                font-size: 22px;
-                font-weight: bold;
-                color: #ffd700;
-            }
-            #info_frame {
-                background-color: #252525;
-                border-radius: 10px;
-                padding: 15px;
-            }
-            .title_label {
-                color: #ffd700;
-                font-size: 24px;
-                font-weight: bold;
-                padding: 10px;
-            }
-            .stat_label {
-                color: #87ceeb;
-                font-size: 16px;
-                font-weight: bold;
-            }
-            .stat_value {
-                color: #ffffff;
-                font-size: 18px;
-                font-weight: bold;
-            }
-            .section_title {
-                color: #ffd700;
-                font-size: 16px;
-                font-weight: bold;
-                padding: 5px 0;
-                border-bottom: 1px solid #3a3a3a;
-            }
-            .progress_bar {
-                background-color: #3a3a3a;
-                border-radius: 4px;
+            QScrollBar::handle:vertical {
+                background-color: #4a6fa5;
+                border-radius: 8px;
                 min-height: 20px;
-                max-height: 20px;
             }
-            .progress_bar::chunk {
-                border-radius: 4px;
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
             }
         """)
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
-        main_layout.setSpacing(20)
-        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(0)
+        main_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Левая панель - ввод данных
+        # Главный сплиттер
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # ===== ЛЕВАЯ ПАНЕЛЬ =====
         left_panel = QWidget()
-        left_panel.setMaximumWidth(380)
+        left_panel.setFixedWidth(360)
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setSpacing(15)
+        left_layout.setSpacing(16)
+        left_layout.setContentsMargins(28, 28, 22, 28)
         
         # Заголовок
         title = QLabel("♟ Шахматный рейтинг")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setObjectName("title_label")
+        title.setStyleSheet("""
+            font-size: 26px;
+            font-weight: bold;
+            color: #ffd700;
+            padding: 10px;
+            letter-spacing: 0.5px;
+        """)
         left_layout.addWidget(title)
         
         # Группа ввода
-        input_group = QGroupBox("Введите данные")
-        input_layout = QGridLayout()
-        input_layout.setSpacing(12)
-        input_layout.setContentsMargins(15, 20, 15, 15)
+        input_group = QGroupBox("Поиск игрока")
+        input_layout = QVBoxLayout()
+        input_layout.setSpacing(14)
+        input_layout.setContentsMargins(18, 20, 18, 18)
         input_group.setLayout(input_layout)
         left_layout.addWidget(input_group)
         
-        # Ник игрока
-        input_layout.addWidget(QLabel("👤 Ник:"), 0, 0)
+        # Ник
+        nick_label = QLabel("👤 Ник:")
+        nick_label.setStyleSheet("color: #aaa; font-size: 13px; font-weight: 500;")
+        input_layout.addWidget(nick_label)
         self.nick_input = QLineEdit()
         self.nick_input.setPlaceholderText("magnuscarlsen")
-        input_layout.addWidget(self.nick_input, 0, 1)
+        self.nick_input.setText("hikaru")
+        input_layout.addWidget(self.nick_input)
         
         # Платформа
-        input_layout.addWidget(QLabel("🌐 Платформа:"), 1, 0)
+        platform_label = QLabel("🌐 Платформа:")
+        platform_label.setStyleSheet("color: #aaa; font-size: 13px; font-weight: 500;")
+        input_layout.addWidget(platform_label)
         self.platform_combo = QComboBox()
         self.platform_combo.addItems(["♛ Lichess", "♚ Chess.com"])
         self.platform_combo.currentTextChanged.connect(self.on_platform_changed)
-        input_layout.addWidget(self.platform_combo, 1, 1)
+        input_layout.addWidget(self.platform_combo)
         
-        # Тип игры
-        input_layout.addWidget(QLabel("⏱ Игра:"), 2, 0)
+        # Игра
+        game_label = QLabel("⏱ Игра:")
+        game_label.setStyleSheet("color: #aaa; font-size: 13px; font-weight: 500;")
+        input_layout.addWidget(game_label)
         self.game_type_combo = QComboBox()
         self.game_type_combo.addItems(["⚡ bullet", "⚡ blitz", "⏳ rapid", "⌛ classical"])
-        input_layout.addWidget(self.game_type_combo, 2, 1)
+        input_layout.addWidget(self.game_type_combo)
         
         # Кнопка
         self.get_rating_btn = QPushButton("🚀 Получить рейтинг")
-        self.get_rating_btn.setMinimumHeight(45)
+        self.get_rating_btn.setMinimumHeight(50)
         self.get_rating_btn.clicked.connect(self.get_rating)
-        input_layout.addWidget(self.get_rating_btn, 3, 0, 1, 2)
+        input_layout.addWidget(self.get_rating_btn)
         
-        # Информация о рангах
-        info_group = QGroupBox("Система рангов")
-        info_layout = QVBoxLayout()
-        info_layout.setSpacing(4)
+        # Система рангов
+        ranks_group = QGroupBox("Система рангов")
+        ranks_layout = QVBoxLayout()
+        ranks_layout.setSpacing(2)
+        ranks_layout.setContentsMargins(16, 14, 16, 14)
+        ranks_group.setLayout(ranks_layout)
+        left_layout.addWidget(ranks_group)
+        
+        rank_colors = {
+            "SSS": "#FF6B6B", "SS": "#FF9F43", "S": "#FECA57",
+            "A": "#54A0FF", "B": "#5F27CD", "C": "#1DD1A1",
+            "D": "#10AC84", "E": "#00D2D3", "F": "#48DBFB", "G": "#8395A7"
+        }
         
         ranks_info = [
             ("SSS", "2700+", "Супер-гроссмейстер"),
-            ("SS", "2500-2699", "Гроссмейстер (GM)"),
-            ("S", "2400-2499", "Международный мастер (IM)"),
-            ("A", "2300-2399", "Мастер ФИДЕ (FM)"),
-            ("B", "2200-2299", "Кандидат в мастера (CM)"),
-            ("C", "2000-2199", "Кандидат в мастера спорта"),
+            ("SS", "2500-2699", "Гроссмейстер"),
+            ("S", "2400-2499", "Международный мастер"),
+            ("A", "2300-2399", "Мастер ФИДЕ"),
+            ("B", "2200-2299", "Кандидат в мастера"),
+            ("C", "2000-2199", "КМС"),
             ("D", "1800-1999", "Первый разряд"),
             ("E", "1600-1799", "Второй разряд"),
             ("F", "1400-1599", "Третий разряд"),
-            ("G", "1000-1399", "Четвёртый разряд")
+            ("G", "1000-1399", "Четвёртый разряд"),
+            ("H", "<1000", "Начальный уровень")
         ]
         
         for rank, rating, desc in ranks_info:
-            rank_label = QLabel(f"<b>{rank}</b>  {rating}  —  {desc}")
-            rank_label.setStyleSheet("color: #aaa; font-size: 11px; padding: 2px;")
-            info_layout.addWidget(rank_label)
+            color = rank_colors.get(rank, "#888")
+            frame = QFrame()
+            frame.setStyleSheet("""
+                QFrame {
+                    border: none;
+                    border-bottom: 1px solid #1a1a1a;
+                    padding: 3px 0;
+                }
+            """)
+            layout = QHBoxLayout(frame)
+            layout.setSpacing(8)
+            layout.setContentsMargins(0, 0, 0, 0)
+            
+            rank_label = QLabel(rank)
+            rank_label.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 12px; min-width: 35px;")
+            
+            rating_label = QLabel(rating)
+            rating_label.setStyleSheet("color: #666; font-size: 12px; min-width: 65px;")
+            
+            desc_label = QLabel(desc)
+            desc_label.setStyleSheet("color: #888; font-size: 11px;")
+            
+            layout.addWidget(rank_label)
+            layout.addWidget(rating_label)
+            layout.addWidget(desc_label)
+            layout.addStretch()
+            ranks_layout.addWidget(frame)
         
-        info_group.setLayout(info_layout)
-        left_layout.addWidget(info_group)
         left_layout.addStretch()
         
-        # Правая панель - информация
+        # ===== ПРАВАЯ ПАНЕЛЬ =====
         right_panel = QWidget()
-        right_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         right_layout = QVBoxLayout(right_panel)
-        right_layout.setSpacing(10)
-        right_layout.setContentsMargins(5, 0, 0, 0)
+        right_layout.setSpacing(16)
+        right_layout.setContentsMargins(30, 28, 30, 30)
         
-        # Информационный фрейм
-        info_frame = QFrame()
-        info_frame.setObjectName("info_frame")
-        info_layout_right = QVBoxLayout(info_frame)
-        info_layout_right.setSpacing(15)
+        # Информационная карточка
+        info_card = QFrame()
+        info_card.setStyleSheet("""
+            QFrame {
+                background-color: #141414;
+                border-radius: 20px;
+                border: 1px solid #2a2a2a;
+                padding: 24px;
+            }
+        """)
+        info_layout = QVBoxLayout(info_card)
+        info_layout.setSpacing(18)
         
-        # Верхняя часть: аватар, ник и комментарий (справа)
+        # Верхняя секция
         top_section = QHBoxLayout()
         top_section.setSpacing(20)
         top_section.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -488,217 +434,158 @@ class ChessRatingApp(QMainWindow):
         avatar_container = QVBoxLayout()
         avatar_container.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.avatar_label = QLabel()
-        self.avatar_label.setObjectName("avatar_label")
+        self.avatar_label.setFixedSize(130, 130)
         self.avatar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.avatar_label.setStyleSheet("""
+            QLabel {
+                background-color: #1e1e1e;
+                border: 3px solid #4a6fa5;
+                border-radius: 12px;
+                font-size: 70px;
+                color: #ccc;
+            }
+        """)
         self.avatar_label.setText("👤")
-        self.avatar_label.setStyleSheet("font-size: 48px; background-color: #2d2d2d; border-radius: 0px;")
         avatar_container.addWidget(self.avatar_label)
         top_section.addLayout(avatar_container)
         
-        # Информация об игроке (слева от комментария)
-        player_info_container = QVBoxLayout()
-        player_info_container.setSpacing(8)
+        # Информация об игроке
+        player_info = QVBoxLayout()
+        player_info.setSpacing(4)
         
         self.username_display = QLabel("Ожидание ввода")
-        self.username_display.setObjectName("username_label")
-        player_info_container.addWidget(self.username_display)
+        self.username_display.setStyleSheet("font-size: 22px; font-weight: bold; color: #ffd700;")
+        player_info.addWidget(self.username_display)
         
-        self.platform_display = QLabel("")
+        self.platform_display = QLabel("🌐 —")
         self.platform_display.setStyleSheet("color: #87ceeb; font-size: 14px;")
-        player_info_container.addWidget(self.platform_display)
+        player_info.addWidget(self.platform_display)
         
-        self.joined_display = QLabel("")
-        self.joined_display.setStyleSheet("color: #aaa; font-size: 13px;")
-        player_info_container.addWidget(self.joined_display)
+        self.joined_display = QLabel("📅 Дата регистрации: —")
+        self.joined_display.setStyleSheet("color: #666; font-size: 13px;")
+        player_info.addWidget(self.joined_display)
         
-        player_info_container.addStretch()
-        top_section.addLayout(player_info_container)
+        self.cache_display = QLabel("")
+        self.cache_display.setStyleSheet("color: #4CAF50; font-size: 12px;")
+        player_info.addWidget(self.cache_display)
         
-        # Комментарий к рейтингу (справа, занимает всё свободное пространство)
-        comment_container = QVBoxLayout()
-        comment_container.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        comment_label = QLabel("📌 Описание ранга:")
-        comment_label.setStyleSheet("color: #87ceeb; font-size: 14px; font-weight: bold;")
-        comment_container.addWidget(comment_label)
+        player_info.addStretch()
+        top_section.addLayout(player_info)
+        
+        # Описание ранга
+        desc_container = QVBoxLayout()
+        desc_container.setAlignment(Qt.AlignmentFlag.AlignTop)
+        
+        desc_label = QLabel("📌 Описание ранга")
+        desc_label.setStyleSheet("color: #87ceeb; font-size: 12px; font-weight: 600; letter-spacing: 0.5px;")
+        desc_container.addWidget(desc_label)
         
         self.rank_description = QLabel("Введите данные и нажмите кнопку")
-        self.rank_description.setObjectName("rank_description_label")
         self.rank_description.setWordWrap(True)
-        self.rank_description.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        comment_container.addWidget(self.rank_description)
+        self.rank_description.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.rank_description.setStyleSheet("""
+            QLabel {
+                color: #ffd700;
+                font-size: 13px;
+                line-height: 1.4;
+                background-color: #1a1a1a;
+                border-radius: 12px;
+                border-left: 4px solid #ffd700;
+                padding: 14px 16px;
+                max-height: 100px;
+            }
+        """)
+        desc_container.addWidget(self.rank_description)
         
-        top_section.addLayout(comment_container, 2)  # Даём больше места комментарию
+        top_section.addLayout(desc_container, 2)
+        info_layout.addLayout(top_section)
         
-        info_layout_right.addLayout(top_section)
-        
-        # Средняя часть: ранг и рейтинг
+        # Средняя секция: ранг и рейтинг
         middle_section = QHBoxLayout()
-        middle_section.setSpacing(30)
+        middle_section.setSpacing(40)
         middle_section.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        middle_section.setContentsMargins(0, 10, 0, 10)
+        
+        # Разделитель
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setStyleSheet("background-color: #222; max-height: 1px;")
+        info_layout.addWidget(separator)
         
         # Ранг
         rank_container = QVBoxLayout()
         rank_container.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        rank_container.addWidget(QLabel("РАНГ"))
+        rank_label = QLabel("РАНГ")
+        rank_label.setStyleSheet("font-size: 13px; color: #888; letter-spacing: 1px; font-weight: 500;")
+        rank_container.addWidget(rank_label)
         self.rank_display = QLabel("?")
-        self.rank_display.setObjectName("rank_label")
         self.rank_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.rank_display.setFixedHeight(90)
+        self.rank_display.setMinimumWidth(110)
+        self.rank_display.setStyleSheet("""
+            QLabel {
+                font-size: 72px;
+                font-weight: 800;
+                background-color: #1e1e1e;
+                border-radius: 16px;
+                border: 2px solid #ffd700;
+                color: #ffd700;
+                padding: 8px 24px;
+            }
+        """)
         rank_container.addWidget(self.rank_display)
         middle_section.addLayout(rank_container)
         
         # Рейтинг
         rating_container = QVBoxLayout()
         rating_container.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        rating_container.addWidget(QLabel("РЕЙТИНГ"))
+        rating_label = QLabel("РЕЙТИНГ")
+        rating_label.setStyleSheet("font-size: 13px; color: #888; letter-spacing: 1px; font-weight: 500;")
+        rating_container.addWidget(rating_label)
         self.rating_display = QLabel("—")
-        self.rating_display.setObjectName("rating_label")
         self.rating_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.rating_display.setFixedHeight(90)
+        self.rating_display.setMinimumWidth(110)
+        self.rating_display.setStyleSheet("""
+            QLabel {
+                font-size: 72px;
+                font-weight: 700;
+                background-color: #1e1e1e;
+                border-radius: 16px;
+                border: 1px solid #2a2a2a;
+                color: #87ceeb;
+                padding: 8px 24px;
+            }
+        """)
         rating_container.addWidget(self.rating_display)
         middle_section.addLayout(rating_container)
         
-        middle_section.addStretch()
-        info_layout_right.addLayout(middle_section)
+        info_layout.addLayout(middle_section)
         
-        # Нижняя часть: статистика (Все игры и Текущая игра друг под другом)
-        stats_section = QVBoxLayout()
-        stats_section.setSpacing(15)
+        right_layout.addWidget(info_card)
+        right_layout.addStretch()
         
-        # Заголовок секции статистики
-        stats_title = QLabel("📊 Подробная характеристика:")
-        stats_title.setObjectName("section_title")
-        stats_section.addWidget(stats_title)
+        # Добавляем панели в сплиттер
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setSizes([360, 840])
         
-        # Блок "Все игры"
-        all_games_group = QGroupBox("Все игры")
-        all_games_layout = QVBoxLayout(all_games_group)
-        all_games_layout.setSpacing(8)
-        self.create_stats_widget(all_games_layout, "all")
-        stats_section.addWidget(all_games_group)
-        
-        # Блок "Текущая игра"
-        current_game_group = QGroupBox("Текущая игра")
-        current_game_layout = QVBoxLayout(current_game_group)
-        current_game_layout.setSpacing(8)
-        self.create_stats_widget(current_game_layout, "current")
-        stats_section.addWidget(current_game_group)
-        
-        info_layout_right.addLayout(stats_section)
-        
-        info_layout_right.addStretch()
-        right_layout.addWidget(info_frame)
-        
-        # Добавляем панели в главный layout
-        main_layout.addWidget(left_panel)
-        main_layout.addWidget(right_panel, 1)
+        main_layout.addWidget(splitter)
         
         # Инициализация
         self.rating_fetcher = None
-        self.current_rating = None
-    
-    def create_stats_widget(self, layout, prefix):
-        """Создаёт виджет статистики"""
-        # Статистика в сетке
-        stats_grid = QGridLayout()
-        stats_grid.setSpacing(8)
-        stats_grid.setColumnStretch(0, 1)
-        stats_grid.setColumnStretch(1, 1)
-        
-        # Всего игр
-        stats_grid.addWidget(QLabel("Всего партий:"), 0, 0)
-        label = QLabel("—")
-        label.setObjectName(f"{prefix}_games_label")
-        label.setStyleSheet("color: #ffffff; font-size: 18px; font-weight: bold;")
-        setattr(self, f"{prefix}_games_label", label)
-        stats_grid.addWidget(label, 0, 1)
-        
-        # Победы
-        stats_grid.addWidget(QLabel("🏆 Победы:"), 1, 0)
-        label = QLabel("—")
-        label.setObjectName(f"{prefix}_wins_label")
-        label.setStyleSheet("color: #4CAF50; font-size: 18px; font-weight: bold;")
-        setattr(self, f"{prefix}_wins_label", label)
-        stats_grid.addWidget(label, 1, 1)
-        
-        # Ничьи
-        stats_grid.addWidget(QLabel("🤝 Ничьи:"), 2, 0)
-        label = QLabel("—")
-        label.setObjectName(f"{prefix}_draws_label")
-        label.setStyleSheet("color: #FFC107; font-size: 18px; font-weight: bold;")
-        setattr(self, f"{prefix}_draws_label", label)
-        stats_grid.addWidget(label, 2, 1)
-        
-        # Поражения
-        stats_grid.addWidget(QLabel("❌ Поражения:"), 3, 0)
-        label = QLabel("—")
-        label.setObjectName(f"{prefix}_losses_label")
-        label.setStyleSheet("color: #f44336; font-size: 18px; font-weight: bold;")
-        setattr(self, f"{prefix}_losses_label", label)
-        stats_grid.addWidget(label, 3, 1)
-        
-        # Проценты
-        stats_grid.addWidget(QLabel("Проценты:"), 4, 0, 1, 2)
-        
-        # Прогресс-бары
-        progress_layout = QVBoxLayout()
-        progress_layout.setSpacing(4)
-        
-        # Победы
-        win_layout = QHBoxLayout()
-        win_layout.addWidget(QLabel("Победы:"))
-        progress = QProgressBar()
-        progress.setObjectName(f"{prefix}_win_progress")
-        progress.setStyleSheet("QProgressBar::chunk { background-color: #4CAF50; }")
-        progress.setRange(0, 100)
-        progress.setValue(0)
-        progress.setTextVisible(True)
-        progress.setFormat("%p%")
-        setattr(self, f"{prefix}_win_progress", progress)
-        win_layout.addWidget(progress)
-        progress_layout.addLayout(win_layout)
-        
-        # Ничьи
-        draw_layout = QHBoxLayout()
-        draw_layout.addWidget(QLabel("Ничьи:"))
-        progress = QProgressBar()
-        progress.setObjectName(f"{prefix}_draw_progress")
-        progress.setStyleSheet("QProgressBar::chunk { background-color: #FFC107; }")
-        progress.setRange(0, 100)
-        progress.setValue(0)
-        progress.setTextVisible(True)
-        progress.setFormat("%p%")
-        setattr(self, f"{prefix}_draw_progress", progress)
-        draw_layout.addWidget(progress)
-        progress_layout.addLayout(draw_layout)
-        
-        # Поражения
-        loss_layout = QHBoxLayout()
-        loss_layout.addWidget(QLabel("Поражения:"))
-        progress = QProgressBar()
-        progress.setObjectName(f"{prefix}_loss_progress")
-        progress.setStyleSheet("QProgressBar::chunk { background-color: #f44336; }")
-        progress.setRange(0, 100)
-        progress.setValue(0)
-        progress.setTextVisible(True)
-        progress.setFormat("%p%")
-        setattr(self, f"{prefix}_loss_progress", progress)
-        loss_layout.addWidget(progress)
-        progress_layout.addLayout(loss_layout)
-        
-        stats_grid.addLayout(progress_layout, 5, 0, 1, 2)
-        layout.addLayout(stats_grid)
+        self.cache_manager = CacheManager()
     
     def on_platform_changed(self, text):
-        """Обновляет список игр при смене платформы"""
         platform = text.split()[-1] if " " in text else text
         self.game_type_combo.clear()
         
         if platform == "Lichess":
             self.game_type_combo.addItems(["⚡ bullet", "⚡ blitz", "⏳ rapid", "⌛ classical", "💥 ultraBullet"])
-        else:  # Chess.com
+        else:
             self.game_type_combo.addItems(["⚡ bullet", "⚡ blitz", "⏳ rapid", "⌛ classical"])
     
     def get_rating(self):
-        """Запускает получение рейтинга"""
         nickname = self.nick_input.text().strip()
         if not nickname:
             QMessageBox.warning(self, "Ошибка", "Введите ник игрока!")
@@ -707,98 +594,40 @@ class ChessRatingApp(QMainWindow):
         platform = self.platform_combo.currentText().split()[-1]
         game_type = self.game_type_combo.currentText().split()[-1]
         
-        # Очищаем предыдущие результаты
         self.rating_display.setText("⏳")
         self.rank_display.setText("⏳")
         self.rank_description.setText("Загрузка...")
         self.get_rating_btn.setEnabled(False)
+        self.get_rating_btn.setText("⏳ Загрузка...")
         self.username_display.setText(nickname)
         self.platform_display.setText(f"🌐 {platform}")
+        self.cache_display.setText("")
         
-        # Запускаем поток для получения данных
         self.rating_fetcher = RatingFetcher(platform, nickname, game_type)
         self.rating_fetcher.finished.connect(self.on_rating_received)
         self.rating_fetcher.error.connect(self.on_rating_error)
         self.rating_fetcher.start()
     
-    def update_stats_widget(self, prefix, games, wins, draws, losses):
-        """Обновляет статистику в виджете"""
-        games_label = getattr(self, f"{prefix}_games_label", None)
-        wins_label = getattr(self, f"{prefix}_wins_label", None)
-        draws_label = getattr(self, f"{prefix}_draws_label", None)
-        losses_label = getattr(self, f"{prefix}_losses_label", None)
-        win_progress = getattr(self, f"{prefix}_win_progress", None)
-        draw_progress = getattr(self, f"{prefix}_draw_progress", None)
-        loss_progress = getattr(self, f"{prefix}_loss_progress", None)
-        
-        if games_label:
-            games_label.setText(str(games) if games > 0 else "0")
-        if wins_label:
-            wins_label.setText(str(wins))
-        if draws_label:
-            draws_label.setText(str(draws))
-        if losses_label:
-            losses_label.setText(str(losses))
-        
-        # Вычисляем проценты
-        if games > 0:
-            win_pct = int((wins / games) * 100)
-            draw_pct = int((draws / games) * 100)
-            loss_pct = int((losses / games) * 100)
-            
-            # Корректируем, чтобы сумма была 100%
-            total = win_pct + draw_pct + loss_pct
-            if total != 100 and total > 0:
-                diff = 100 - total
-                if win_pct >= draw_pct and win_pct >= loss_pct:
-                    win_pct += diff
-                elif draw_pct >= win_pct and draw_pct >= loss_pct:
-                    draw_pct += diff
-                else:
-                    loss_pct += diff
-            
-            if win_progress:
-                win_progress.setValue(win_pct)
-            if draw_progress:
-                draw_progress.setValue(draw_pct)
-            if loss_progress:
-                loss_progress.setValue(loss_pct)
-        else:
-            if win_progress:
-                win_progress.setValue(0)
-            if draw_progress:
-                draw_progress.setValue(0)
-            if loss_progress:
-                loss_progress.setValue(0)
-    
     def on_rating_received(self, data):
-        """Обработка полученных данных"""
         rating = data['rating']
         avatar_url = data['avatar']
         username = data['username']
         joined = data['joined']
         platform = data['platform']
         
-        # Общая статистика
-        total_games = data['total_games']
-        total_wins = data['total_wins']
-        total_draws = data['total_draws']
-        total_losses = data['total_losses']
-        
-        # Статистика текущей игры
-        game_type = self.game_type_combo.currentText().split()[-1]
-        game_stats = data['game_stats'].get(game_type, {})
-        game_games = game_stats.get('games', 0)
-        game_wins = game_stats.get('wins', 0)
-        game_draws = game_stats.get('draws', 0)
-        game_losses = game_stats.get('losses', 0)
-        
-        self.current_rating = rating
         self.rating_display.setText(str(rating))
         self.username_display.setText(username)
-        self.platform_display.setText(f"🌐 {platform}")
+        self.platform_display.setText(f"🌐 {platform if platform == 'Lichess' else 'Chess.com'}")
         
-        # Дата регистрации
+        cache_key = f"{platform}_{username}_{self.game_type_combo.currentText().split()[-1]}"
+        cached_data = self.cache_manager.get(cache_key)
+        if cached_data:
+            self.cache_display.setText("⚡ Из кеша")
+            self.cache_display.setStyleSheet("color: #4CAF50; font-size: 12px;")
+        else:
+            self.cache_display.setText("🔄 Свежие данные")
+            self.cache_display.setStyleSheet("color: #87ceeb; font-size: 12px;")
+        
         if joined:
             try:
                 if platform == "Lichess":
@@ -811,38 +640,48 @@ class ChessRatingApp(QMainWindow):
         else:
             self.joined_display.setText("📅 Дата регистрации: неизвестна")
         
-        # Загружаем аватарку
         if avatar_url:
             self.load_avatar(avatar_url)
         else:
-            if platform == "Lichess":
-                self.avatar_label.setText("♛")
-            else:
-                self.avatar_label.setText("♚")
+            self.avatar_label.setText("♛" if platform == "Lichess" else "♚")
             self.avatar_label.setPixmap(QPixmap())
-            self.avatar_label.setStyleSheet("font-size: 48px; background-color: #2d2d2d; border-radius: 0px;")
+            self.avatar_label.setStyleSheet("""
+                QLabel {
+                    background-color: #1e1e1e;
+                    border: 3px solid #4a6fa5;
+                    border-radius: 12px;
+                    font-size: 70px;
+                    color: #ccc;
+                }
+            """)
         
-        # Определяем ранг
-        rank, description = self.get_rank(rating)
+        rank, description, color = self.get_rank(rating)
         self.rank_display.setText(rank)
+        self.rank_display.setStyleSheet(f"""
+            QLabel {{
+                font-size: 72px;
+                font-weight: 800;
+                background-color: #1e1e1e;
+                border-radius: 16px;
+                border: 2px solid {color};
+                color: {color};
+                padding: 8px 24px;
+            }}
+        """)
         self.rank_description.setText(description)
         
-        # Обновляем статистику
-        self.update_stats_widget("all", total_games, total_wins, total_draws, total_losses)
-        self.update_stats_widget("current", game_games, game_wins, game_draws, game_losses)
-        
         self.get_rating_btn.setEnabled(True)
+        self.get_rating_btn.setText("🚀 Получить рейтинг")
     
     def on_rating_error(self, error_msg):
-        """Обработка ошибок"""
         QMessageBox.warning(self, "Ошибка", error_msg)
         self.rating_display.setText("❌")
         self.rank_display.setText("—")
         self.rank_description.setText("❌ Ошибка получения данных")
         self.get_rating_btn.setEnabled(True)
+        self.get_rating_btn.setText("🚀 Получить рейтинг")
     
     def load_avatar(self, url):
-        """Загружает аватарку по URL (квадратную)"""
         try:
             if url:
                 response = requests.get(url, timeout=5)
@@ -850,53 +689,71 @@ class ChessRatingApp(QMainWindow):
                     pixmap = QPixmap()
                     pixmap.loadFromData(BytesIO(response.content).getvalue())
                     if not pixmap.isNull():
-                        pixmap = pixmap.scaled(120, 120, Qt.AspectRatioMode.IgnoreAspectRatio, 
+                        pixmap = pixmap.scaled(130, 130, Qt.AspectRatioMode.KeepAspectRatioByExpanding, 
                                               Qt.TransformationMode.SmoothTransformation)
+                        x = (pixmap.width() - 130) // 2
+                        y = (pixmap.height() - 130) // 2
+                        pixmap = pixmap.copy(x, y, 130, 130)
                         self.avatar_label.setPixmap(pixmap)
                         self.avatar_label.setText("")
-                        self.avatar_label.setStyleSheet("background-color: #2d2d2d; border-radius: 0px;")
+                        self.avatar_label.setStyleSheet("""
+                            QLabel {
+                                background-color: #1e1e1e;
+                                border: 3px solid #4a6fa5;
+                                border-radius: 12px;
+                                padding: 0;
+                            }
+                        """)
                         return
-            # Если не удалось загрузить, показываем иконку
             platform = self.platform_combo.currentText().split()[-1]
-            if platform == "Lichess":
-                self.avatar_label.setText("♛")
-            else:
-                self.avatar_label.setText("♚")
+            self.avatar_label.setText("♛" if platform == "Lichess" else "♚")
             self.avatar_label.setPixmap(QPixmap())
-            self.avatar_label.setStyleSheet("font-size: 48px; background-color: #2d2d2d; border-radius: 0px;")
+            self.avatar_label.setStyleSheet("""
+                QLabel {
+                    background-color: #1e1e1e;
+                    border: 3px solid #4a6fa5;
+                    border-radius: 12px;
+                    font-size: 70px;
+                    color: #ccc;
+                }
+            """)
         except:
             platform = self.platform_combo.currentText().split()[-1]
-            if platform == "Lichess":
-                self.avatar_label.setText("♛")
-            else:
-                self.avatar_label.setText("♚")
+            self.avatar_label.setText("♛" if platform == "Lichess" else "♚")
             self.avatar_label.setPixmap(QPixmap())
-            self.avatar_label.setStyleSheet("font-size: 48px; background-color: #2d2d2d; border-radius: 0px;")
+            self.avatar_label.setStyleSheet("""
+                QLabel {
+                    background-color: #1e1e1e;
+                    border: 3px solid #4a6fa5;
+                    border-radius: 12px;
+                    font-size: 70px;
+                    color: #ccc;
+                }
+            """)
     
     def get_rank(self, rating):
-        """Определяет ранг на основе рейтинга"""
         if rating >= 2700:
-            return "SSS", "Супер-гроссмейстер (2700+) — элита мировых шахмат"
+            return "SSS", "Супер-гроссмейстер (2700+) — Элита мировых шахмат. Игроки этого уровня входят в топ-30 планеты. Они обладают феноменальной памятью, глубочайшим пониманием дебютов и эндшпиля, а также уникальной интуицией. Ошибки — редкость, а каждая партия — это произведение искусства. Здесь играют Карлсен, Каруана, Непомнящий. Попасть сюда — значит войти в историю шахмат.", "#FF6B6B"
         elif rating >= 2500:
-            return "SS", "Международный гроссмейстер (GM) (2500-2699) — высшее звание"
+            return "SS", "Гроссмейстер (GM) (2500-2699) — Высшее официальное звание ФИДЕ. Гроссмейстер — это профессионал, который прошёл через тысячи турнирных партий. Он видит тактические комбинации на 5–10 ходов вперёд, безупречно разыгрывает сложнейшие эндшпили и может обыграть 99,9% шахматистов мира с завязанными глазами. Это уровень постоянных турниров, работы с секундантами и борьбы за звание чемпиона страны.", "#FF9F43"
         elif rating >= 2400:
-            return "S", "Международный мастер (IM) (2400-2499) — профессионал высокого уровня"
+            return "S", "Международный мастер (IM) (2400-2499) — Профессионал высокого уровня. Международный мастер — это игрок, который буквально живёт шахматами. Он имеет глубокие знания в дебютной теории, отлично чувствует динамику позиции и редко ошибается даже в цейтноте. Такой игрок может дать фору любому любителю и успешно конкурирует с гроссмейстерами в быстрых шахматах. Это своего рода «чёрный пояс» в мире шахмат.", "#FECA57"
         elif rating >= 2300:
-            return "A", "Мастер ФИДЕ (FM) (2300-2399) — сильный профессиональный игрок"
+            return "A", "Мастер ФИДЕ (FM) (2300-2399) — Сильный профессиональный игрок. Мастер ФИДЕ — это тот, кто уже получил международное признание. У него отличная тактическая подготовка, он уверенно разыгрывает миттельшпиль и понимает тонкие позиционные нюансы. Такой игрок легко выигрывает у любителей с форой в фигуру и может работать тренером или аналитиком. Это рубеж, за которым начинается настоящий профессионализм.", "#54A0FF"
         elif rating >= 2200:
-            return "B", "Кандидат в мастера ФИДЕ (CM) (2200-2299) — опытный игрок"
+            return "B", "Кандидат в мастера ФИДЕ (CM) (2200-2299) — Опытный турнирный игрок. Кандидат в мастера — это крепкий шахматист, который уже не допускает грубых тактических ошибок. Он знает основные дебюты за обе стороны, умеет строить позиционные планы и грамотно реализовывать лишнюю пешку в эндшпиле. На этом уровне уже можно претендовать на призовые места в открытых турнирах и успешно противостоять мастерам в рапиде.", "#5F27CD"
         elif rating >= 2000:
-            return "C", "Кандидат в мастера спорта (2000-2199) — очень сильный любитель"
+            return "C", "Кандидат в мастера спорта (2000-2199) — Очень сильный любитель. Такой игрок уже имеет спортивный разряд и участвует в официальных соревнованиях. Он уверенно побеждает в клубных турнирах, хорошо знает дебютные схемы, умеет считать варианты на 3–4 хода вперёд и не теряет голову в сложных позициях. Это тот уровень, когда шахматы перестают быть просто игрой и становятся серьёзным хобби с турнирной практикой.", "#1DD1A1"
         elif rating >= 1800:
-            return "D", "Первый разряд (1800-1999) — сильный любитель"
+            return "D", "Первый разряд (1800-1999) — Сильный любитель. Игрок первого разряда — это гордость любого шахматного клуба. Он уже имеет системные знания дебютов, уверенно разыгрывает типовые позиции и редко зевает фигуры. Умеет ставить мат в эндшпиле и может дать бой кандидату в мастера в быстрой партии. На этом уровне начинается настоящее понимание позиционной борьбы.", "#10AC84"
         elif rating >= 1600:
-            return "E", "Второй разряд (1600-1799) — опытный любитель"
+            return "E", "Второй разряд (1600-1799) — Опытный любитель. Такой игрок уже прошёл «детские» ошибки. Он знает принципы развития фигур, контролирует центр, не забывает про рокировку. Может увидеть простую тактику в 2–3 хода и понимает, как играть в эндшпиле с равным материалом. Играет регулярно, участвует в турнирах выходного дня и стабильно растёт в рейтинге. До первого разряда — всего пара удачных турниров.", "#00D2D3"
         elif rating >= 1400:
-            return "F", "Третий разряд (1400-1599) — средний любитель"
+            return "F", "Третий разряд (1400-1599) — Средний любитель. Уверенный игрок, который знает основные правила и уже имеет турнирный опыт. Он не зевает мат в один ход, знает пару дебютов (например, итальянку или испанку) и умеет ставить простые матовые конструкции. Играет осмысленно, но иногда ещё допускает позиционные просчёты. Это самый массовый уровень среди взрослых любителей, играющих в клубах.", "#48DBFB"
         elif rating >= 1000:
-            return "G", "Четвёртый разряд (1000-1399) — начинающий любитель"
+            return "G", "Четвёртый разряд (1000-1399) — Начинающий любитель. Игрок, который уже освоил основы: знает ценность фигур, умеет рокироваться, ставить детский мат и видит одноходовые угрозы. Пока ещё не всегда понимает, как строить план в миттельшпиле, но уже не делает грубых ошибок в каждом ходе. Регулярно играет онлайн и постепенно набирает опыт. Главное на этом этапе — больше практики!", "#8395A7"
         else:
-            return "H", "Начальный уровень (менее 1000) — новичок"
+            return "H", "Начальный уровень (менее 1000) — Новичок. Только начинает свой путь в шахматах. Знает, как ходят фигуры, но часто забывает про рокировку или ценность пешек. Счёт вариантов ограничен 1–2 ходами, а эндшпиль кажется сложным. Но это самый важный этап — именно здесь закладывается любовь к игре. Ошибки неизбежны, но каждая партия — это шаг вперёд. Рекомендация: больше играть, решать задачи и смотреть лекции для начинающих.", "#888"
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
